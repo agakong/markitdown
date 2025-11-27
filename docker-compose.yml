@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  markitdown-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: markitdown-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # 挂载宿主机目录到容器的 /data/input 目录
+      # 请修改为你实际的本地目录路径
+      - ./data/input:/data/input:ro
+    environment:
+      # 输入目录（容器内路径，通常不需要修改）
+      - INPUT_DIR=/data/input
+      # API 服务端口
+      - PORT=8000
+      - HOST=0.0.0.0
+      # 回调 URL（可选，也可以在每次请求时传递）
+      # - CALLBACK_URL=http://your-callback-server.com/callback
+      # 最大重试次数
+      - MAX_RETRIES=3
+      # 回调超时时间（秒）
+      - CALLBACK_TIMEOUT=30
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
