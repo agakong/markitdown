@@ -3,6 +3,7 @@
 """
 MarkItDown API Server
 提供文件转换 API 接口，支持队列处理和回调机制
+支持从阿里云 OSS 读取文件进行转换
 """
 import os
 import logging
@@ -10,6 +11,7 @@ import queue
 import threading
 import time
 import uuid
+import tempfile
 from pathlib import Path
 from typing import Optional, Dict, Any
 from dataclasses import dataclass, asdict
@@ -19,8 +21,32 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
+import oss2
 
 from markitdown import MarkItDown
+
+# 尝试导入 env.py 配置（如果不存在则使用环境变量）
+try:
+    from env import (
+        OSS_ACCESS_KEY_ID,
+        OSS_ACCESS_KEY_SECRET,
+        OSS_ENDPOINT,
+        OSS_BUCKET_NAME,
+        CALLBACK_URL,
+        MAX_RETRIES,
+        CALLBACK_TIMEOUT,
+        TEMP_DIR
+    )
+except ImportError:
+    # 如果 env.py 不存在，使用环境变量
+    OSS_ACCESS_KEY_ID = os.getenv("OSS_ACCESS_KEY_ID", "")
+    OSS_ACCESS_KEY_SECRET = os.getenv("OSS_ACCESS_KEY_SECRET", "")
+    OSS_ENDPOINT = os.getenv("OSS_ENDPOINT", "oss-cn-chengdu.aliyuncs.com")
+    OSS_BUCKET_NAME = os.getenv("OSS_BUCKET_NAME", "markitdown")
+    CALLBACK_URL = os.getenv("CALLBACK_URL", "")
+    MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+    CALLBACK_TIMEOUT = int(os.getenv("CALLBACK_TIMEOUT", "30"))
+    TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/markitdown")
 
 # 配置日志（支持中文）
 logging.basicConfig(
@@ -48,20 +74,74 @@ queue_lock = threading.Lock()
 # 任务状态存储（简单实现，生产环境建议使用 Redis 等）
 task_status: Dict[str, Dict[str, Any]] = {}
 
+# 辅助函数：获取环境变量，如果为空则使用默认值
+def get_env_or_default(key: str, default: str) -> str:
+    """获取环境变量，如果未设置或为空字符串则返回默认值"""
+    value = os.getenv(key, default)
+    return value if value else default
+
 # 配置
 CONFIG = {
-    "input_dir": os.getenv("INPUT_DIR", "/data/input"),  # 挂载的输入目录
-    "callback_url": os.getenv("CALLBACK_URL", ""),  # 回调 URL（可选，也可通过 API 传递）
-    "max_retries": int(os.getenv("MAX_RETRIES", "3")),  # 最大重试次数
-    "callback_timeout": int(os.getenv("CALLBACK_TIMEOUT", "30")),  # 回调超时时间（秒）
+    # OSS 配置（从 env.py 或环境变量读取）
+    "oss_access_key_id": OSS_ACCESS_KEY_ID,
+    "oss_access_key_secret": OSS_ACCESS_KEY_SECRET,
+    "oss_endpoint": OSS_ENDPOINT,
+    "oss_bucket_name": OSS_BUCKET_NAME,
+    # 回调配置
+    "callback_url": CALLBACK_URL,
+    "max_retries": MAX_RETRIES,
+    "callback_timeout": CALLBACK_TIMEOUT,
+    # 临时文件目录
+    "temp_dir": TEMP_DIR,
 }
+
+# OSS 客户端（延迟初始化）
+oss_auth = None
+oss_bucket = None
+
+
+def init_oss_client():
+    """初始化 OSS 客户端"""
+    global oss_auth, oss_bucket
+    
+    access_key_id = CONFIG["oss_access_key_id"].strip() if CONFIG["oss_access_key_id"] else ""
+    access_key_secret = CONFIG["oss_access_key_secret"].strip() if CONFIG["oss_access_key_secret"] else ""
+    endpoint = CONFIG["oss_endpoint"].strip() if CONFIG["oss_endpoint"] else ""
+    bucket_name = CONFIG["oss_bucket_name"].strip() if CONFIG["oss_bucket_name"] else ""
+    
+    if not access_key_id or not access_key_secret:
+        logger.warning("OSS 配置不完整，将无法从 OSS 读取文件")
+        logger.warning(f"  AccessKey ID: {'已配置' if access_key_id else '未配置'}")
+        logger.warning(f"  AccessKey Secret: {'已配置' if access_key_secret else '未配置'}")
+        return None
+    
+    if not endpoint or not bucket_name:
+        logger.warning("OSS Endpoint 或 Bucket 名称未配置")
+        logger.warning(f"  Endpoint: {endpoint if endpoint else '未配置'}")
+        logger.warning(f"  Bucket: {bucket_name if bucket_name else '未配置'}")
+        return None
+    
+    # 更新 CONFIG 为处理后的值
+    CONFIG["oss_access_key_id"] = access_key_id
+    CONFIG["oss_access_key_secret"] = access_key_secret
+    CONFIG["oss_endpoint"] = endpoint
+    CONFIG["oss_bucket_name"] = bucket_name
+    
+    try:
+        oss_auth = oss2.Auth(CONFIG["oss_access_key_id"], CONFIG["oss_access_key_secret"])
+        oss_bucket = oss2.Bucket(oss_auth, CONFIG["oss_endpoint"], CONFIG["oss_bucket_name"])
+        logger.info(f"OSS 客户端初始化成功: {CONFIG['oss_endpoint']}/{CONFIG['oss_bucket_name']}")
+        return oss_bucket
+    except Exception as e:
+        logger.error(f"OSS 客户端初始化失败: {str(e)}")
+        return None
 
 
 @dataclass
 class ConversionTask:
     """转换任务"""
     task_id: str
-    filename: str
+    oss_path: str  # OSS 文件路径
     callback_url: Optional[str] = None
     created_at: str = ""
     
@@ -72,7 +152,7 @@ class ConversionTask:
 
 class ConversionRequest(BaseModel):
     """转换请求模型"""
-    filename: str = Field(..., description="待转换的文件名（相对于输入目录）")
+    oss_path: str = Field(..., description="OSS 文件路径（相对于 Bucket 根目录，例如：files/document.pdf）")
     callback_url: Optional[str] = Field(None, description="回调 URL（可选，如果配置了全局回调 URL 则使用全局的）")
 
 
@@ -112,30 +192,27 @@ def send_callback(callback_url: str, data: Dict[str, Any], task_id: str):
 def process_conversion_task(task: ConversionTask, markitdown: MarkItDown):
     """处理单个转换任务"""
     task_id = task.task_id
-    filename = task.filename
+    oss_path = task.oss_path
     callback_url = task.callback_url or CONFIG.get("callback_url")
+    local_file_path = None
     
     # 更新任务状态为处理中
     with queue_lock:
         task_status[task_id] = {
             "task_id": task_id,
             "status": "processing",
-            "filename": filename,
+            "filename": oss_path,  # 使用 oss_path 作为文件名显示
             "created_at": task.created_at,
             "completed_at": None,
             "error": None
         }
     
-    logger.info(f"任务 {task_id}: 开始转换文件 {filename}")
+    logger.info(f"任务 {task_id}: 开始转换文件 {oss_path}")
     
     try:
-        # 构建文件完整路径
-        input_dir = Path(CONFIG["input_dir"])
-        file_path = input_dir / filename
-        
-        # 检查文件是否存在
-        if not file_path.exists():
-            error_msg = f"文件不存在: {filename}"
+        # 检查 OSS 客户端是否初始化
+        if oss_bucket is None:
+            error_msg = "OSS 客户端未初始化，请检查配置"
             logger.error(f"任务 {task_id}: {error_msg}")
             
             with queue_lock:
@@ -143,21 +220,71 @@ def process_conversion_task(task: ConversionTask, markitdown: MarkItDown):
                 task_status[task_id]["error"] = error_msg
                 task_status[task_id]["completed_at"] = datetime.now().isoformat()
             
-            # 发送错误回调
             if callback_url:
                 send_callback(callback_url, {
                     "task_id": task_id,
                     "status": "failed",
-                    "filename": filename,
+                    "oss_path": oss_path,
                     "error": error_msg,
                     "timestamp": datetime.now().isoformat()
                 }, task_id)
+            return
+        
+        # 从 OSS 下载文件到临时目录
+        logger.info(f"任务 {task_id}: 从 OSS 下载文件 {oss_path}")
+        
+        # 确保临时目录存在
+        temp_dir = Path(CONFIG["temp_dir"])
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 创建临时文件
+        file_extension = Path(oss_path).suffix or ".tmp"
+        local_file_path = temp_dir / f"{task_id}{file_extension}"
+        
+        try:
+            # 从 OSS 下载文件
+            oss_bucket.get_object_to_file(oss_path, str(local_file_path))
+            logger.info(f"任务 {task_id}: 文件下载成功，保存到 {local_file_path}")
+        except oss2.exceptions.NoSuchKey:
+            error_msg = f"OSS 文件不存在: {oss_path}"
+            logger.error(f"任务 {task_id}: {error_msg}")
             
+            with queue_lock:
+                task_status[task_id]["status"] = "failed"
+                task_status[task_id]["error"] = error_msg
+                task_status[task_id]["completed_at"] = datetime.now().isoformat()
+            
+            if callback_url:
+                send_callback(callback_url, {
+                    "task_id": task_id,
+                    "status": "failed",
+                    "oss_path": oss_path,
+                    "error": error_msg,
+                    "timestamp": datetime.now().isoformat()
+                }, task_id)
+            return
+        except Exception as e:
+            error_msg = f"从 OSS 下载文件失败: {str(e)}"
+            logger.error(f"任务 {task_id}: {error_msg}", exc_info=True)
+            
+            with queue_lock:
+                task_status[task_id]["status"] = "failed"
+                task_status[task_id]["error"] = error_msg
+                task_status[task_id]["completed_at"] = datetime.now().isoformat()
+            
+            if callback_url:
+                send_callback(callback_url, {
+                    "task_id": task_id,
+                    "status": "failed",
+                    "oss_path": oss_path,
+                    "error": error_msg,
+                    "timestamp": datetime.now().isoformat()
+                }, task_id)
             return
         
         # 执行转换
-        logger.info(f"任务 {task_id}: 正在转换文件 {file_path}")
-        result = markitdown.convert(str(file_path))
+        logger.info(f"任务 {task_id}: 正在转换文件 {local_file_path}")
+        result = markitdown.convert(str(local_file_path))
         markdown_content = result.markdown
         
         logger.info(f"任务 {task_id}: 转换成功，内容长度: {len(markdown_content)} 字符")
@@ -173,7 +300,7 @@ def process_conversion_task(task: ConversionTask, markitdown: MarkItDown):
             send_callback(callback_url, {
                 "task_id": task_id,
                 "status": "completed",
-                "filename": filename,
+                "oss_path": oss_path,
                 "markdown": markdown_content,
                 "timestamp": datetime.now().isoformat()
             }, task_id)
@@ -195,10 +322,19 @@ def process_conversion_task(task: ConversionTask, markitdown: MarkItDown):
             send_callback(callback_url, {
                 "task_id": task_id,
                 "status": "failed",
-                "filename": filename,
+                "oss_path": oss_path,
                 "error": error_msg,
                 "timestamp": datetime.now().isoformat()
             }, task_id)
+    
+    finally:
+        # 清理临时文件
+        if local_file_path and local_file_path.exists():
+            try:
+                local_file_path.unlink()
+                logger.info(f"任务 {task_id}: 临时文件已删除 {local_file_path}")
+            except Exception as e:
+                logger.warning(f"任务 {task_id}: 删除临时文件失败 {local_file_path}: {str(e)}")
 
 
 def queue_worker():
@@ -244,12 +380,17 @@ def start_queue_worker():
 def startup_event():
     """应用启动时执行"""
     logger.info("MarkItDown API Server 启动")
-    logger.info(f"输入目录: {CONFIG['input_dir']}")
+    logger.info(f"临时目录: {CONFIG['temp_dir']}")
+    logger.info(f"OSS Bucket: {CONFIG.get('oss_bucket_name', '未配置')}")
+    logger.info(f"OSS Endpoint: {CONFIG.get('oss_endpoint', '未配置')}")
     logger.info(f"回调 URL: {CONFIG.get('callback_url', '未配置')}")
     
-    # 确保输入目录存在
-    input_dir = Path(CONFIG["input_dir"])
-    input_dir.mkdir(parents=True, exist_ok=True)
+    # 确保临时目录存在
+    temp_dir = Path(CONFIG["temp_dir"])
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 初始化 OSS 客户端
+    init_oss_client()
     
     # 启动队列工作线程
     start_queue_worker()
@@ -279,12 +420,22 @@ def health():
 @app.post("/convert", response_model=ConversionResponse)
 def convert_file(request: ConversionRequest):
     """提交转换任务"""
-    # 验证文件是否存在
-    input_dir = Path(CONFIG["input_dir"])
-    file_path = input_dir / request.filename
+    # 检查 OSS 客户端是否初始化
+    if oss_bucket is None:
+        raise HTTPException(status_code=500, detail="OSS 客户端未初始化，请检查配置")
     
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail=f"文件不存在: {request.filename}")
+    # 验证 OSS 文件是否存在（可选，提前验证）
+    oss_path = request.oss_path.strip()
+    if not oss_path:
+        raise HTTPException(status_code=400, detail="OSS 文件路径不能为空")
+    
+    try:
+        # 检查文件是否存在（快速检查，不下载文件）
+        if not oss_bucket.object_exists(oss_path):
+            raise HTTPException(status_code=404, detail=f"OSS 文件不存在: {oss_path}")
+    except Exception as e:
+        logger.warning(f"检查 OSS 文件存在性时出错，将继续处理: {str(e)}")
+        # 继续处理，实际下载时会再次检查
     
     # 生成任务 ID
     task_id = f"task_{uuid.uuid4().hex[:12]}"
@@ -293,7 +444,7 @@ def convert_file(request: ConversionRequest):
     callback_url = request.callback_url or CONFIG.get("callback_url")
     task = ConversionTask(
         task_id=task_id,
-        filename=request.filename,
+        oss_path=oss_path,
         callback_url=callback_url
     )
     
@@ -305,13 +456,13 @@ def convert_file(request: ConversionRequest):
         task_status[task_id] = {
             "task_id": task_id,
             "status": "queued",
-            "filename": request.filename,
+            "filename": oss_path,  # 使用 oss_path 作为显示名称
             "created_at": task.created_at,
             "completed_at": None,
             "error": None
         }
     
-    logger.info(f"任务 {task_id}: 已加入队列，文件: {request.filename}")
+    logger.info(f"任务 {task_id}: 已加入队列，OSS 路径: {oss_path}")
     
     return ConversionResponse(
         task_id=task_id,
