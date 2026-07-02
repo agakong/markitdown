@@ -171,6 +171,7 @@ class TaskStatusResponse(BaseModel):
     created_at: str
     completed_at: Optional[str] = None
     error: Optional[str] = None
+    markdown: Optional[str] = None
 
 
 def send_callback(callback_url: str, data: Dict[str, Any], task_id: str):
@@ -294,6 +295,7 @@ def process_conversion_task(task: ConversionTask, markitdown: MarkItDown):
             task_status[task_id]["status"] = "completed"
             task_status[task_id]["completed_at"] = datetime.now().isoformat()
             task_status[task_id]["markdown_length"] = len(markdown_content)
+            task_status[task_id]["markdown"] = markdown_content
         
         # 发送成功回调
         if callback_url:
